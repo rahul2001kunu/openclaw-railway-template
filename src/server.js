@@ -1071,12 +1071,200 @@ function redactSecrets(text) {
     .replace(/(AA[A-Za-z0-9_-]{10,}:\S{10,})/g, "[REDACTED]");
 }
 
+// ========== DEBUG CONSOLE: HELPER FUNCTIONS & ALLOWLIST ==========
+
+// Extract device requestIds from device list output for validation
+function extractDeviceRequestIds(output) {
+  const ids = [];
+  const lines = (output || "").split("\n");
+  // Look for lines with requestId format: alphanumeric, underscore, dash
+  for (const line of lines) {
+    const match = line.match(/requestId[:\s]+([A-Za-z0-9_-]+)/i);
+    if (match) ids.push(match[1]);
+  }
+  return ids;
+}
+
+// Allowlisted commands for debug console (security-critical: no arbitrary shell execution)
+const ALLOWED_CONSOLE_COMMANDS = new Set([
+  // Gateway lifecycle (wrapper-managed, no openclaw CLI needed)
+  "gateway.restart",
+  "gateway.stop",
+  "gateway.start",
+  
+  // OpenClaw CLI commands (all safe, read-only or user-controlled)
+  "openclaw.version",
+  "openclaw.status",
+  "openclaw.health",
+  "openclaw.doctor",
+  "openclaw.logs.tail",
+  "openclaw.config.get",
+  "openclaw.devices.list",
+  "openclaw.devices.approve",
+  "openclaw.plugins.list",
+  "openclaw.plugins.enable",
+]);
+
+// Debug console command handler (POST /setup/api/console/run)
+app.post("/setup/api/console/run", requireSetupAuth, async (req, res) => {
+  try {
+    const { command, arg } = req.body || {};
+    
+    // Validate command is allowlisted
+    if (!command || !ALLOWED_CONSOLE_COMMANDS.has(command)) {
+      return res.status(400).json({
+        ok: false,
+        error: `Command not allowed: ${command || "(empty)"}`,
+      });
+    }
+    
+    let result;
+    
+    // Gateway lifecycle commands (wrapper-managed, no openclaw CLI)
+    if (command === "gateway.restart") {
+      await restartGateway();
+      result = { code: 0, output: "Gateway restarted successfully\n" };
+    } else if (command === "gateway.stop") {
+      if (gatewayProc) {
+        gatewayProc.kill("SIGTERM");
+        gatewayProc = null;
+        result = { code: 0, output: "Gateway stopped\n" };
+      } else {
+        result = { code: 0, output: "Gateway not running\n" };
+      }
+    } else if (command === "gateway.start") {
+      await ensureGatewayRunning();
+      result = { code: 0, output: "Gateway started successfully\n" };
+    }
+    
+    // OpenClaw CLI commands
+    else if (command === "openclaw.version") {
+      result = await runCmd(OPENCLAW_NODE, clawArgs(["--version"]));
+    } else if (command === "openclaw.status") {
+      result = await runCmd(OPENCLAW_NODE, clawArgs(["status"]));
+    } else if (command === "openclaw.health") {
+      result = await runCmd(OPENCLAW_NODE, clawArgs(["health"]));
+    } else if (command === "openclaw.doctor") {
+      result = await runCmd(OPENCLAW_NODE, clawArgs(["doctor"]));
+    } else if (command === "openclaw.logs.tail") {
+      // arg is the tail count (default 50)
+      const count = arg?.trim() || "50";
+      if (!/^\d+$/.test(count)) {
+        return res.status(400).json({
+          ok: false,
+          error: "Invalid tail count (must be a number)",
+        });
+      }
+      result = await runCmd(OPENCLAW_NODE, clawArgs(["logs", "--tail", count]));
+    } else if (command === "openclaw.config.get") {
+      // arg is the config path (e.g., "gateway.port")
+      const configPath = arg?.trim();
+      if (!configPath) {
+        return res.status(400).json({
+          ok: false,
+          error: "Config path required (e.g., gateway.port)",
+        });
+      }
+      result = await runCmd(OPENCLAW_NODE, clawArgs(["config", "get", configPath]));
+    } else if (command === "openclaw.devices.list") {
+      result = await runCmd(OPENCLAW_NODE, clawArgs(["devices", "list"]));
+    } else if (command === "openclaw.devices.approve") {
+      // arg is the device requestId
+      const requestId = arg?.trim();
+      if (!requestId) {
+        return res.status(400).json({
+          ok: false,
+          error: "Device requestId required",
+        });
+      }
+      // Validate requestId format (alphanumeric, underscore, dash)
+      if (!/^[A-Za-z0-9_-]+$/.test(requestId)) {
+        return res.status(400).json({
+          ok: false,
+          error: "Invalid requestId format (alphanumeric, underscore, dash only)",
+        });
+      }
+      result = await runCmd(OPENCLAW_NODE, clawArgs(["devices", "approve", requestId]));
+    } else if (command === "openclaw.plugins.list") {
+      result = await runCmd(OPENCLAW_NODE, clawArgs(["plugins", "list"]));
+    } else if (command === "openclaw.plugins.enable") {
+      // arg is the plugin name
+      const pluginName = arg?.trim();
+      if (!pluginName) {
+        return res.status(400).json({
+          ok: false,
+          error: "Plugin name required",
+        });
+      }
+      // Validate plugin name format (alphanumeric, underscore, dash)
+      if (!/^[A-Za-z0-9_-]+$/.test(pluginName)) {
+        return res.status(400).json({
+          ok: false,
+          error: "Invalid plugin name format (alphanumeric, underscore, dash only)",
+        });
+      }
+      result = await runCmd(OPENCLAW_NODE, clawArgs(["plugins", "enable", pluginName]));
+    } else {
+      // Should never reach here due to allowlist check
+      return res.status(500).json({
+        ok: false,
+        error: "Internal error: command allowlisted but not implemented",
+      });
+    }
+    
+    // Apply secret redaction to all output
+    const output = redactSecrets(result.output || "");
+    
+    return res.json({
+      ok: result.code === 0,
+      output,
+      exitCode: result.code,
+    });
+  } catch (err) {
+    console.error("[/setup/api/console/run] error:", err);
+    return res.status(500).json({
+      ok: false,
+      error: `Internal error: ${String(err)}`,
+    });
+  }
+});
+
 app.get("/setup/api/debug", requireSetupAuth, async (_req, res) => {
   const v = await runCmd(OPENCLAW_NODE, clawArgs(["--version"]));
   const help = await runCmd(
     OPENCLAW_NODE,
     clawArgs(["channels", "add", "--help"]),
   );
+  
+  // Enhanced diagnostics: channel config checks
+  let telegramConfig = null;
+  let discordConfig = null;
+  try {
+    const tg = await runCmd(OPENCLAW_NODE, clawArgs(["config", "get", "channels.telegram"]));
+    if (tg.code === 0) {
+      telegramConfig = redactSecrets(tg.output.trim());
+    }
+  } catch {}
+  
+  try {
+    const dc = await runCmd(OPENCLAW_NODE, clawArgs(["config", "get", "channels.discord"]));
+    if (dc.code === 0) {
+      discordConfig = redactSecrets(dc.output.trim());
+    }
+  } catch {}
+  
+  // Gateway diagnostics
+  const gatewayReachable = isConfigured() ? await probeGateway() : false;
+  
+  // Doctor output (cached or fresh)
+  let doctorOutput = lastDoctorOutput;
+  if (!doctorOutput && isConfigured()) {
+    try {
+      const dr = await runCmd(OPENCLAW_NODE, clawArgs(["doctor"]));
+      doctorOutput = redactSecrets(dr.output || "");
+    } catch {}
+  }
+  
   res.json({
     wrapper: {
       node: process.version,
@@ -1095,6 +1283,18 @@ app.get("/setup/api/debug", requireSetupAuth, async (_req, res) => {
       node: OPENCLAW_NODE,
       version: v.output.trim(),
       channelsAddHelpIncludesTelegram: help.output.includes("telegram"),
+    },
+    channels: {
+      telegram: telegramConfig,
+      discord: discordConfig,
+    },
+    gateway: {
+      reachable: gatewayReachable,
+      lastError: lastGatewayError,
+      lastExit: lastGatewayExit,
+    },
+    diagnostics: {
+      doctor: doctorOutput,
     },
   });
 });

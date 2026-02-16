@@ -133,5 +133,71 @@
       .catch(function (e) { logEl.textContent += 'Error: ' + String(e) + '\n'; });
   };
 
+  // ========== DEBUG CONSOLE ==========
+  var consoleCommandEl = document.getElementById('consoleCommand');
+  var consoleArgEl = document.getElementById('consoleArg');
+  var consoleRunBtn = document.getElementById('consoleRun');
+  var consoleOutputEl = document.getElementById('consoleOutput');
+
+  function runConsoleCommand() {
+    var command = consoleCommandEl.value;
+    var arg = consoleArgEl.value.trim();
+
+    if (!command) {
+      consoleOutputEl.textContent = 'Error: Please select a command';
+      return;
+    }
+
+    // Disable button and show loading state
+    consoleRunBtn.disabled = true;
+    consoleRunBtn.textContent = 'Running...';
+    consoleOutputEl.textContent = 'Executing command...\n';
+
+    fetch('/setup/api/console/run', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ command: command, arg: arg })
+    })
+      .then(function (res) {
+        return res.text().then(function (text) {
+          return { status: res.status, text: text };
+        });
+      })
+      .then(function (result) {
+        var j;
+        try {
+          j = JSON.parse(result.text);
+        } catch (_e) {
+          j = { ok: false, error: result.text };
+        }
+
+        if (j.ok) {
+          consoleOutputEl.textContent = j.output || '(no output)';
+        } else {
+          consoleOutputEl.textContent = 'Error: ' + (j.error || j.output || 'Unknown error');
+        }
+
+        // Re-enable button
+        consoleRunBtn.disabled = false;
+        consoleRunBtn.textContent = 'Run Command';
+      })
+      .catch(function (e) {
+        consoleOutputEl.textContent = 'Error: ' + String(e);
+        consoleRunBtn.disabled = false;
+        consoleRunBtn.textContent = 'Run Command';
+      });
+  }
+
+  consoleRunBtn.onclick = runConsoleCommand;
+
+  // Enter key in arg field executes command
+  consoleArgEl.onkeydown = function (e) {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      runConsoleCommand();
+    }
+  };
+
   refreshStatus();
 })();

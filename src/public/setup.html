@@ -21,6 +21,48 @@
   </div>
 
   <div class="card">
+    <h2>Debug Console</h2>
+    <p class="muted">Run OpenClaw commands without SSH access. All commands are allowlisted for security.</p>
+    
+    <label>Command</label>
+    <select id="consoleCommand">
+      <option value="">-- Select command --</option>
+      <optgroup label="Gateway Lifecycle">
+        <option value="gateway.restart">gateway.restart - Restart gateway process</option>
+        <option value="gateway.stop">gateway.stop - Stop gateway process</option>
+        <option value="gateway.start">gateway.start - Start gateway process</option>
+      </optgroup>
+      <optgroup label="OpenClaw Status">
+        <option value="openclaw.version">openclaw.version - Show OpenClaw version</option>
+        <option value="openclaw.status">openclaw.status - Show gateway status</option>
+        <option value="openclaw.health">openclaw.health - Run health check</option>
+        <option value="openclaw.doctor">openclaw.doctor - Run diagnostics</option>
+      </optgroup>
+      <optgroup label="Logs & Config">
+        <option value="openclaw.logs.tail">openclaw.logs.tail - Show recent logs (arg: count)</option>
+        <option value="openclaw.config.get">openclaw.config.get - Get config value (arg: path)</option>
+      </optgroup>
+      <optgroup label="Devices">
+        <option value="openclaw.devices.list">openclaw.devices.list - List devices</option>
+        <option value="openclaw.devices.approve">openclaw.devices.approve - Approve device (arg: requestId)</option>
+      </optgroup>
+      <optgroup label="Plugins">
+        <option value="openclaw.plugins.list">openclaw.plugins.list - List plugins</option>
+        <option value="openclaw.plugins.enable">openclaw.plugins.enable - Enable plugin (arg: name)</option>
+      </optgroup>
+    </select>
+    
+    <label>Argument (if required)</label>
+    <input id="consoleArg" type="text" placeholder="e.g., 50 for logs tail, gateway.port for config get, requestId for device approve" />
+    <div class="muted" style="margin-top: 0.25rem">
+      Some commands require arguments: logs tail (count), config get (path), devices approve (requestId), plugins enable (name).
+    </div>
+    
+    <button id="consoleRun">Run Command</button>
+    <pre id="consoleOutput" style="margin-top: 1rem; max-height: 400px; overflow-y: auto; background: #f5f5f5; padding: 0.75rem; border-radius: 4px;"></pre>
+  </div>
+
+  <div class="card">
     <h2>1) Model/auth provider</h2>
     <p class="muted">Matches the groups shown in the terminal onboarding.</p>
     <label>Provider group</label>

@@ -8,8 +8,35 @@ import express from "express";
 import httpProxy from "http-proxy";
 import * as tar from "tar";
 
+// ========== ENVIRONMENT VARIABLE MIGRATION ==========
+// Auto-migrate legacy CLAWDBOT_* and MOLTBOT_* env vars to OPENCLAW_* for backward compatibility.
+// This ensures existing Railway deployments continue working after the rename.
+const ENV_MIGRATIONS = [
+  { old: "CLAWDBOT_PUBLIC_PORT", new: "OPENCLAW_PUBLIC_PORT" },
+  { old: "MOLTBOT_PUBLIC_PORT", new: "OPENCLAW_PUBLIC_PORT" },
+  { old: "CLAWDBOT_STATE_DIR", new: "OPENCLAW_STATE_DIR" },
+  { old: "MOLTBOT_STATE_DIR", new: "OPENCLAW_STATE_DIR" },
+  { old: "CLAWDBOT_WORKSPACE_DIR", new: "OPENCLAW_WORKSPACE_DIR" },
+  { old: "MOLTBOT_WORKSPACE_DIR", new: "OPENCLAW_WORKSPACE_DIR" },
+  { old: "CLAWDBOT_GATEWAY_TOKEN", new: "OPENCLAW_GATEWAY_TOKEN" },
+  { old: "MOLTBOT_GATEWAY_TOKEN", new: "OPENCLAW_GATEWAY_TOKEN" },
+  { old: "CLAWDBOT_CONFIG_PATH", new: "OPENCLAW_CONFIG_PATH" },
+  { old: "MOLTBOT_CONFIG_PATH", new: "OPENCLAW_CONFIG_PATH" },
+];
+
+for (const { old, new: newVar } of ENV_MIGRATIONS) {
+  if (process.env[old] && !process.env[newVar]) {
+    console.warn(`[env-migration] Detected legacy ${old}, auto-migrating to ${newVar}`);
+    process.env[newVar] = process.env[old];
+  }
+}
+
 // Railway commonly sets PORT=8080 for HTTP services.
-const PORT = Number.parseInt(process.env.PORT ?? "8080", 10);
+// Prefer OPENCLAW_PUBLIC_PORT (explicit user config) over Railway's default PORT.
+const PORT = Number.parseInt(
+  process.env.OPENCLAW_PUBLIC_PORT?.trim() || process.env.PORT || "8080",
+  10,
+);
 const STATE_DIR =
   process.env.OPENCLAW_STATE_DIR?.trim() ||
   path.join(os.homedir(), ".openclaw");
@@ -91,20 +118,91 @@ function clawArgs(args) {
   return [OPENCLAW_ENTRY, ...args];
 }
 
-function configPath() {
-  return (
-    process.env.OPENCLAW_CONFIG_PATH?.trim() ||
-    path.join(STATE_DIR, "openclaw.json")
-  );
+// Returns all candidate config paths in priority order.
+// Supports explicit override + legacy config file migration.
+function resolveConfigCandidates() {
+  const candidates = [];
+  
+  // 1. Explicit override (highest priority)
+  const explicit = process.env.OPENCLAW_CONFIG_PATH?.trim();
+  if (explicit) {
+    candidates.push(explicit);
+  }
+  
+  // 2. Current openclaw.json
+  candidates.push(path.join(STATE_DIR, "openclaw.json"));
+  
+  // 3. Legacy config files (for auto-migration)
+  candidates.push(path.join(STATE_DIR, "moltbot.json"));
+  candidates.push(path.join(STATE_DIR, "clawdbot.json"));
+  
+  return candidates;
 }
 
-function isConfigured() {
-  try {
-    return fs.existsSync(configPath());
-  } catch {
-    return false;
-  }
+// Returns the active config path (prefers explicit override, falls back to default location).
+function configPath() {
+  const explicit = process.env.OPENCLAW_CONFIG_PATH?.trim();
+  if (explicit) return explicit;
+  return path.join(STATE_DIR, "openclaw.json");
 }
+
+// Returns true if any config file exists (including legacy files).
+function isConfigured() {
+  const candidates = resolveConfigCandidates();
+  for (const candidate of candidates) {
+    try {
+      if (fs.existsSync(candidate)) {
+        return true;
+      }
+    } catch {
+      // ignore
+    }
+  }
+  return false;
+}
+
+// ========== LEGACY CONFIG FILE MIGRATION ==========
+// Auto-migrate legacy config files (moltbot.json, clawdbot.json) → openclaw.json on module load.
+// This runs once at startup before any gateway operations.
+(function migrateLegacyConfigFiles() {
+  const target = configPath();
+  
+  // If target already exists, nothing to migrate
+  try {
+    if (fs.existsSync(target)) {
+      return;
+    }
+  } catch {
+    return;
+  }
+  
+  // Check for legacy files and migrate the first one found
+  const legacyFiles = [
+    path.join(STATE_DIR, "moltbot.json"),
+    path.join(STATE_DIR, "clawdbot.json"),
+  ];
+  
+  for (const legacyPath of legacyFiles) {
+    try {
+      if (fs.existsSync(legacyPath)) {
+        console.warn(`[config-migration] Found legacy config file: ${legacyPath}`);
+        console.warn(`[config-migration] Renaming to: ${target}`);
+        
+        // Ensure target directory exists
+        fs.mkdirSync(path.dirname(target), { recursive: true });
+        
+        // Rename (atomic on same filesystem)
+        fs.renameSync(legacyPath, target);
+        
+        console.warn(`[config-migration] ✓ Migration complete`);
+        return;
+      }
+    } catch (err) {
+      console.error(`[config-migration] Failed to migrate ${legacyPath}: ${err.message}`);
+      // Continue checking other legacy files
+    }
+  }
+})();
 
 let gatewayProc = null;
 let gatewayStarting = null;
@@ -284,27 +382,53 @@ async function restartGateway() {
 
   // Kill gateway process tracked by wrapper
   if (gatewayProc) {
-    console.log("[gateway] Killing wrapper-managed gateway process");
+    console.log(`[gateway] Killing wrapper-managed gateway process (PID: ${gatewayProc.pid})`);
     try {
       gatewayProc.kill("SIGTERM");
-    } catch {
-      // ignore
+    } catch (err) {
+      console.log(`[gateway] Failed to kill wrapper process: ${err.message}`);
     }
     gatewayProc = null;
   }
 
   // Also kill any other gateway processes (e.g., started by onboard command)
-  // by finding processes listening on the gateway port
-  console.log(`[gateway] Killing any other gateway processes on port ${INTERNAL_GATEWAY_PORT}`);
-  try {
-    const killResult = await runCmd("pkill", ["-f", "openclaw-gateway"]);
-    console.log(`[gateway] pkill result: exit code ${killResult.code}`);
-  } catch (err) {
-    console.log(`[gateway] pkill failed: ${err.message}`);
+  // Use pkill to ensure ALL gateway processes are stopped before restart
+  console.log(`[gateway] Ensuring all gateway processes stopped with pkill...`);
+  
+  // Try multiple patterns to catch all gateway variants
+  const killPatterns = [
+    "gateway run",           // Main gateway command
+    "openclaw.*gateway",     // Any openclaw gateway process
+    `port.*${INTERNAL_GATEWAY_PORT}`, // Processes using our port
+  ];
+  
+  for (const pattern of killPatterns) {
+    try {
+      const killResult = await runCmd("pkill", ["-f", pattern], { timeoutMs: 5000 });
+      if (killResult.code === 0) {
+        console.log(`[gateway] pkill -f "${pattern}" succeeded`);
+      }
+    } catch (err) {
+      // pkill returns 1 if no processes match, which is fine
+      console.log(`[gateway] pkill -f "${pattern}": ${err.message}`);
+    }
   }
 
   // Give processes time to exit and release the port
-  await sleep(1500);
+  // Increased from 1.5s to 2s for more reliable cleanup
+  await sleep(2000);
+
+  // Verify port is actually free before restarting
+  try {
+    const stillListening = await probeGateway();
+    if (stillListening) {
+      console.warn(`[gateway] ⚠️  Port ${INTERNAL_GATEWAY_PORT} still in use after pkill!`);
+      // Wait a bit longer
+      await sleep(3000);
+    }
+  } catch {
+    // probeGateway throws if port is free, which is what we want
+  }
 
   return ensureGatewayRunning();
 }
@@ -558,6 +682,32 @@ function buildOnboardArgs(payload) {
 
     // Map secret to correct flag for common choices.
     const secret = (payload.authSecret || "").trim();
+    
+    // Auth choices that require a secret (API keys, tokens, etc.)
+    const requiresSecret = [
+      "openai-api-key",
+      "apiKey",
+      "token",
+      "openrouter-api-key",
+      "ai-gateway-api-key",
+      "moonshot-api-key",
+      "kimi-code-api-key",
+      "gemini-api-key",
+      "zai-api-key",
+      "minimax-api",
+      "minimax-api-lightning",
+      "synthetic-api-key",
+      "opencode-zen",
+    ];
+    
+    // Validate: if user selected an auth choice that requires a secret, fail fast
+    if (requiresSecret.includes(payload.authChoice) && !secret) {
+      throw new Error(
+        `Auth choice "${payload.authChoice}" requires an API key or token, but none was provided. ` +
+        `Please provide the secret in the setup form.`
+      );
+    }
+    
     const map = {
       "openai-api-key": "--openai-api-key",
       apiKey: "--anthropic-api-key",
@@ -586,7 +736,11 @@ function buildOnboardArgs(payload) {
   return args;
 }
 
+// Runs a command with timeout support (default: 120s).
+// Escalates from SIGTERM → SIGKILL to prevent hanging commands.
 function runCmd(cmd, args, opts = {}) {
+  const timeoutMs = opts.timeoutMs ?? 120_000; // 2 minutes default
+  
   return new Promise((resolve) => {
     const proc = childProcess.spawn(cmd, args, {
       ...opts,
@@ -598,15 +752,52 @@ function runCmd(cmd, args, opts = {}) {
     });
 
     let out = "";
+    let timedOut = false;
+    let killTimer = null;
+    
     proc.stdout?.on("data", (d) => (out += d.toString("utf8")));
     proc.stderr?.on("data", (d) => (out += d.toString("utf8")));
 
+    // Timeout handler: SIGTERM first, then SIGKILL after 5s
+    const timeoutTimer = setTimeout(() => {
+      timedOut = true;
+      out += `\n[timeout] Command exceeded ${timeoutMs}ms, sending SIGTERM...\n`;
+      
+      try {
+        proc.kill("SIGTERM");
+      } catch (err) {
+        out += `[timeout] SIGTERM failed: ${err.message}\n`;
+      }
+      
+      // Escalate to SIGKILL after 5 seconds
+      killTimer = setTimeout(() => {
+        out += `[timeout] Process still alive after SIGTERM, sending SIGKILL...\n`;
+        try {
+          proc.kill("SIGKILL");
+        } catch (err) {
+          out += `[timeout] SIGKILL failed: ${err.message}\n`;
+        }
+      }, 5000);
+    }, timeoutMs);
+
     proc.on("error", (err) => {
+      clearTimeout(timeoutTimer);
+      if (killTimer) clearTimeout(killTimer);
       out += `\n[spawn error] ${String(err)}\n`;
       resolve({ code: 127, output: out });
     });
 
-    proc.on("close", (code) => resolve({ code: code ?? 0, output: out }));
+    proc.on("close", (code) => {
+      clearTimeout(timeoutTimer);
+      if (killTimer) clearTimeout(killTimer);
+      
+      if (timedOut && code === null) {
+        // Process was killed by our timeout handler
+        resolve({ code: 124, output: out }); // 124 = timeout exit code (like GNU timeout)
+      } else {
+        resolve({ code: code ?? 0, output: out });
+      }
+    });
   });
 }
 
@@ -734,6 +925,19 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
       await runCmd(
         OPENCLAW_NODE,
         clawArgs(["config", "set", "gateway.controlUi.allowInsecureAuth", "true"]),
+      );
+
+      // Configure Railway reverse proxy trust (fixes X-Forwarded-* header handling)
+      // Railway's proxy sits at 127.0.0.1, so we trust that for accurate client IPs
+      await runCmd(
+        OPENCLAW_NODE,
+        clawArgs([
+          "config",
+          "set",
+          "--json",
+          "gateway.trustedProxies",
+          JSON.stringify(["127.0.0.1"]),
+        ]),
       );
 
       const channelsHelp = await runCmd(
@@ -915,7 +1119,31 @@ app.post("/setup/api/reset", requireSetupAuth, async (_req, res) => {
   // Minimal reset: delete the config file so /setup can rerun.
   // Keep credentials/sessions/workspace by default.
   try {
+    // Stop gateway before deleting config to prevent race conditions
+    // (gateway may try to read/write config during shutdown)
+    console.log("[reset] Stopping gateway before config deletion...");
+    if (gatewayProc) {
+      try {
+        gatewayProc.kill("SIGTERM");
+        gatewayProc = null;
+      } catch (err) {
+        console.warn(`[reset] Failed to stop gateway: ${err.message}`);
+      }
+    }
+    
+    // Also pkill any orphaned gateway processes
+    try {
+      await runCmd("pkill", ["-f", "gateway run"], { timeoutMs: 5000 });
+    } catch {
+      // Ignore pkill errors (process may not exist)
+    }
+    
+    // Wait for gateway to fully stop
+    await sleep(1000);
+    
+    console.log("[reset] Deleting config file...");
     fs.rmSync(configPath(), { force: true });
+    
     res
       .type("text/plain")
       .send("OK - deleted config file. You can rerun setup now.");
@@ -981,8 +1209,22 @@ const proxy = httpProxy.createProxyServer({
   xfwd: true,
 });
 
-proxy.on("error", (err, _req, _res) => {
-  console.error("[proxy]", err);
+// Prevent proxy errors from crashing the wrapper.
+// Common errors: ECONNREFUSED (gateway not ready), ECONNRESET (client disconnect).
+proxy.on("error", (err, req, res) => {
+  console.error("[proxy] error:", err.message, `(${req?.method} ${req?.url})`);
+  
+  // Only send error response if headers haven't been sent yet
+  if (res && !res.headersSent) {
+    try {
+      res.writeHead(502, { "Content-Type": "text/plain" });
+      res.end(`Proxy error: ${err.message}\nGateway may not be ready. Check /healthz for status.`);
+    } catch {
+      // Response already partially sent, can't recover
+    }
+  }
+  
+  // Don't throw - just log and continue
 });
 
 // Inject auth token into HTTP proxy requests
@@ -1007,10 +1249,26 @@ app.use(async (req, res) => {
     try {
       await ensureGatewayRunning();
     } catch (err) {
-      return res
-        .status(503)
-        .type("text/plain")
-        .send(`Gateway not ready: ${String(err)}`);
+      // Provide helpful troubleshooting hints
+      const errorMsg = [
+        "Gateway failed to start or is not ready.",
+        "",
+        `Error: ${String(err)}`,
+        "",
+        "Troubleshooting steps:",
+        "1. Check /healthz for gateway diagnostics",
+        "2. Verify OPENCLAW_STATE_DIR is writable",
+        "3. Check Railway logs for gateway startup errors",
+        "4. Ensure openclaw.json is valid JSON",
+        "",
+        lastGatewayError ? `Last gateway error: ${lastGatewayError}` : "",
+        lastGatewayExit ? `Last gateway exit: code=${lastGatewayExit.code} signal=${lastGatewayExit.signal} at=${lastGatewayExit.at}` : "",
+        lastDoctorOutput ? `\nRecent diagnostics:\n${lastDoctorOutput.slice(0, 1000)}` : "",
+      ]
+        .filter(Boolean)
+        .join("\n");
+      
+      return res.status(503).type("text/plain").send(errorMsg);
     }
   }
 
@@ -1069,12 +1327,36 @@ server.on("upgrade", async (req, socket, head) => {
   });
 });
 
-process.on("SIGTERM", () => {
-  // Best-effort shutdown
-  try {
-    if (gatewayProc) gatewayProc.kill("SIGTERM");
-  } catch {
-    // ignore
+// Graceful shutdown handler for Railway deployments
+process.on("SIGTERM", async () => {
+  console.log("[shutdown] Received SIGTERM, starting graceful shutdown...");
+  
+  // Close HTTP server (stops accepting new connections)
+  server.close(() => {
+    console.log("[shutdown] HTTP server closed");
+  });
+  
+  // Stop gateway process
+  if (gatewayProc) {
+    console.log("[shutdown] Stopping gateway process...");
+    try {
+      gatewayProc.kill("SIGTERM");
+      gatewayProc = null;
+    } catch (err) {
+      console.error(`[shutdown] Failed to stop gateway: ${err.message}`);
+    }
   }
-  process.exit(0);
+  
+  // Give in-flight requests time to complete (Railway allows ~10s)
+  // Wait up to 5 seconds for graceful shutdown
+  setTimeout(() => {
+    console.log("[shutdown] Graceful shutdown timeout, forcing exit");
+    process.exit(0);
+  }, 5000);
+  
+  // If all connections close naturally, exit immediately
+  server.on("close", () => {
+    console.log("[shutdown] All connections closed, exiting cleanly");
+    process.exit(0);
+  });
 });

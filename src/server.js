@@ -65,7 +65,9 @@ function resolveGatewayToken() {
   if (envTok) {
     console.log(`[token] ✓ Using token from OPENCLAW_GATEWAY_TOKEN env variable`);
     console.log(`[token]   First 16 chars: ${envTok.slice(0, 16)}...`);
-    console.log(`[token]   Full token: ${envTok}`);
+    if (DEBUG) {
+      console.log(`[token]   Full token: ${envTok}`);
+    }
     return envTok;
   }
 
@@ -98,7 +100,7 @@ function resolveGatewayToken() {
 
 const OPENCLAW_GATEWAY_TOKEN = resolveGatewayToken();
 process.env.OPENCLAW_GATEWAY_TOKEN = OPENCLAW_GATEWAY_TOKEN;
-console.log(`[token] Final resolved token: ${OPENCLAW_GATEWAY_TOKEN.slice(0, 16)}... (len: ${OPENCLAW_GATEWAY_TOKEN.length})`);
+debug(`[token] Final resolved token: ${OPENCLAW_GATEWAY_TOKEN.slice(0, 16)}... (len: ${OPENCLAW_GATEWAY_TOKEN.length})`);
 console.log(`[token] ========== TOKEN RESOLUTION COMPLETE ==========\n`);
 
 // Where the gateway will listen internally (we proxy to it).
@@ -917,8 +919,10 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
 
         if (configToken !== OPENCLAW_GATEWAY_TOKEN) {
           console.error(`[onboard] ✗ ERROR: Token mismatch after config set!`);
-          console.error(`[onboard]   Full wrapper token: ${OPENCLAW_GATEWAY_TOKEN}`);
-          console.error(`[onboard]   Full config token:  ${configToken || 'null'}`);
+          if (DEBUG) {
+            console.error(`[onboard]   Full wrapper token: ${OPENCLAW_GATEWAY_TOKEN}`);
+            console.error(`[onboard]   Full config token:  ${configToken || 'null'}`);
+          }
           extra += `\n[ERROR] Token verification failed! Config has different token than wrapper.\n`;
           extra += `  Wrapper: ${OPENCLAW_GATEWAY_TOKEN.slice(0, 16)}...\n`;
           extra += `  Config:  ${configToken?.slice(0, 16)}...\n`;
@@ -1486,9 +1490,11 @@ app.post("/setup/api/config/raw", requireSetupAuth, async (req, res) => {
     // Size limit: 500KB to prevent DoS
     const MAX_SIZE = 500 * 1024;
     if (content.length > MAX_SIZE) {
+      const sizeKB = (content.length / 1024).toFixed(1);
+      const maxKB = (MAX_SIZE / 1024).toFixed(0);
       return res.status(400).json({
         ok: false,
-        error: `Config file too large (${content.length} bytes, max ${MAX_SIZE} bytes)`,
+        error: `Config file too large: ${sizeKB}KB (max ${maxKB}KB)`,
       });
     }
     
@@ -1687,7 +1693,9 @@ function readBodyBuffer(req, maxBytes) {
       
       if (totalSize > maxBytes) {
         req.destroy();
-        reject(new Error(`Request body exceeds size limit of ${maxBytes} bytes`));
+        const sizeMB = (totalSize / (1024 * 1024)).toFixed(1);
+        const maxMB = (maxBytes / (1024 * 1024)).toFixed(0);
+        reject(new Error(`File too large: ${sizeMB}MB (max ${maxMB}MB)`));
         return;
       }
       
@@ -1722,7 +1730,7 @@ app.post("/setup/import", requireSetupAuth, async (req, res) => {
       console.error("[import] Security check failed: STATE_DIR or WORKSPACE_DIR not under /data");
       return res.status(400).json({
         ok: false,
-        error: "Import is only supported when STATE_DIR and WORKSPACE_DIR are under /data (Railway volume)",
+        error: `Import requires both STATE_DIR and WORKSPACE_DIR under /data. Current: STATE_DIR=${STATE_DIR}, WORKSPACE_DIR=${WORKSPACE_DIR}. Set OPENCLAW_STATE_DIR=/data/.openclaw and OPENCLAW_WORKSPACE_DIR=/data/workspace in Railway Variables.`,
       });
     }
     
@@ -1970,7 +1978,7 @@ proxy.on("error", (err, req, res) => {
 
 // Inject auth token into HTTP proxy requests
 proxy.on("proxyReq", (proxyReq, req, res) => {
-  console.log(`[proxy] HTTP ${req.method} ${req.url} - injecting token: ${OPENCLAW_GATEWAY_TOKEN.slice(0, 16)}...`);
+  debug(`[proxy] HTTP ${req.method} ${req.url} - injecting token: ${OPENCLAW_GATEWAY_TOKEN.slice(0, 16)}...`);
   proxyReq.setHeader("Authorization", `Bearer ${OPENCLAW_GATEWAY_TOKEN}`);
 });
 
@@ -2028,10 +2036,13 @@ const server = app.listen(PORT, async () => {
 
   // Harden state dir for OpenClaw and avoid missing credentials dir on fresh volumes.
   try {
-    fs.mkdirSync(path.join(STATE_DIR, "credentials"), { recursive: true });
+    fs.mkdirSync(path.join(STATE_DIR, "credentials"), { recursive: true, mode: 0o700 });
   } catch {}
   try {
     fs.chmodSync(STATE_DIR, 0o700);
+  } catch {}
+  try {
+    fs.chmodSync(path.join(STATE_DIR, "credentials"), 0o700);
   } catch {}
 
   // Auto-start the gateway if already configured so polling channels (Telegram/Discord/etc.)
@@ -2061,7 +2072,7 @@ server.on("upgrade", async (req, socket, head) => {
   }
 
   // Inject auth token via headers option (req.headers modification doesn't work for WS)
-  console.log(`[ws-upgrade] Proxying WebSocket upgrade with token: ${OPENCLAW_GATEWAY_TOKEN.slice(0, 16)}...`);
+  debug(`[ws-upgrade] Proxying WebSocket upgrade with token: ${OPENCLAW_GATEWAY_TOKEN.slice(0, 16)}...`);
 
   proxy.ws(req, socket, head, {
     target: GATEWAY_TARGET,

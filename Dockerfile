@@ -24,6 +24,7 @@ WORKDIR /openclaw
 # - Set OPENCLAW_VERSION Railway variable to use a specific tag (e.g., v2026.2.15)
 # - If not set, defaults to main branch (original behavior)
 # - Can also override locally with --build-arg OPENCLAW_VERSION=<tag>
+# - Modified to use rahul2001kunu/openclaw fork
 ARG OPENCLAW_VERSION
 RUN set -eu; \
   if [ -n "${OPENCLAW_VERSION:-}" ]; then \
@@ -33,7 +34,7 @@ RUN set -eu; \
     REF="main"; \
     echo "⚠ OPENCLAW_VERSION not set, using main branch (may be unstable)"; \
   fi; \
-  git clone --depth 1 --branch "${REF}" https://github.com/openclaw/openclaw.git .
+  git clone --depth 1 --branch "${REF}" https://github.com/rahul2001kunu/openclaw.git .
 
 # Patch: relax version requirements for packages that may reference unpublished versions.
 # Apply to all extension package.json files to handle workspace protocol (workspace:*).

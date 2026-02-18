@@ -50,7 +50,7 @@ ENV OPENCLAW_PREFER_PNPM=1
 RUN pnpm ui:install && pnpm ui:build
 
 
-# Runtime image
+# Runtime image - v2 with Tailscale support (rebuild 2026-02-18)
 FROM node:22-bookworm
 ENV NODE_ENV=production
 

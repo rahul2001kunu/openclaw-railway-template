@@ -71,6 +71,7 @@ RUN apt-get update \
     iptables \
     gnupg \
     lsb-release \
+    # Cache bust: 2026-02-18-v3
   && rm -rf /var/lib/apt/lists/*
 
 # Install Tailscale

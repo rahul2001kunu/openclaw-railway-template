@@ -50,9 +50,12 @@ ENV OPENCLAW_PREFER_PNPM=1
 RUN pnpm ui:install && pnpm ui:build
 
 
-# Runtime image - v2 with Tailscale support (rebuild 2026-02-18)
+# Runtime image - v2 with Tailscale support (rebuild 2026-02-18-v4)
 FROM node:22-bookworm
 ENV NODE_ENV=production
+
+# Cache buster for Tailscale rebuild - 2026-02-18T18:15:00Z
+RUN echo "Rebuilding with Tailscale support v4"
 
 RUN apt-get update \
   && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
@@ -71,7 +74,6 @@ RUN apt-get update \
     iptables \
     gnupg \
     lsb-release \
-    # Cache bust: 2026-02-18-v3
   && rm -rf /var/lib/apt/lists/*
 
 # Install Tailscale

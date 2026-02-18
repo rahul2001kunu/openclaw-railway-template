@@ -100,9 +100,7 @@ RUN printf '%s\n' '#!/usr/bin/env bash' 'exec node /openclaw/dist/entry.js "$@"'
 RUN npm install -g mcporter
 
 COPY src ./src
-
-# Create default skills directory with Tavily web search skill
-RUN mkdir -p /openclaw/skills/tavily-web-search
+COPY skills /openclaw/skills
 
 ENV PORT=8080
 EXPOSE 8080

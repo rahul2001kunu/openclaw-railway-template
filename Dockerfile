@@ -99,6 +99,9 @@ RUN printf '%s\n' '#!/usr/bin/env bash' 'exec node /openclaw/dist/entry.js "$@"'
 # Install mcporter globally for MCP tool access
 RUN npm install -g mcporter
 
+# Install gogcli for Google Workspace (Gmail, Calendar, Drive)
+RUN brew install steipete/tap/gogcli
+
 COPY src ./src
 COPY skills /openclaw/skills
 

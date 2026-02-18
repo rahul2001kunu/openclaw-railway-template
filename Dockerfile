@@ -122,7 +122,16 @@ COPY skills /openclaw/skills
 ENV PORT=8080
 EXPOSE 8080
 
-# Start script that initializes Tailscale (userspace mode) then runs OpenClaw
+# Tailscale Serve config for HTTPS access via MagicDNS
+# This proxies HTTPS (443) to the gateway (18789) with proper headers
+RUN printf '%s\n' \
+  '{' \
+  '  "TCP": {"443": {"HTTPS": true}},' \
+  '  "Web": {"${TS_CERT_DOMAIN}:443": {"Handlers": {"/": {"Proxy": "http://127.0.0.1:18789"}}}}' \
+  '}' \
+  > /app/tailscale-serve-config.json
+
+# Start script that initializes Tailscale Serve then runs OpenClaw
 RUN printf '%s\n' \
   '#!/bin/bash' \
   'set -e' \
@@ -133,7 +142,18 @@ RUN printf '%s\n' \
   '  tailscaled --tun=userspace-networking --state=/var/lib/tailscale/tailscaled.state --socket=/var/run/tailscale/tailscaled.sock &' \
   '  sleep 3' \
   '  tailscale up --authkey="$TS_AUTHKEY" --hostname="${TS_HOSTNAME:-openclaw-gateway}" --accept-routes' \
-  '  echo "Tailscale connected: $(tailscale ip -4 2>/dev/null || echo waiting...)"' \
+  '  TS_IP=$(tailscale ip -4 2>/dev/null || echo "")' \
+  '  echo "Tailscale connected: ${TS_IP}"' \
+  '' \
+  '  # Enable Tailscale Serve for HTTPS access via MagicDNS' \
+  '  if [ -n "$TS_IP" ]; then' \
+  '    TS_CERT_DOMAIN="${TS_HOSTNAME:-openclaw-gateway}.tail$(tailscale status --json 2>/dev/null | grep -o "\"TailnetName\":\"[^\"]*\"" | cut -d\" -f4).ts.net"' \
+  '    export TS_CERT_DOMAIN' \
+  '    # Substitute domain in serve config and apply' \
+  '    envsubst < /app/tailscale-serve-config.json > /tmp/serve-config.json' \
+  '    tailscale serve --bg /tmp/serve-config.json 2>/dev/null || echo "Serve already configured"' \
+  '    echo "Tailscale Serve active: https://${TS_CERT_DOMAIN}/"' \
+  '  fi' \
   'fi' \
   '' \
   '# Start OpenClaw wrapper' \

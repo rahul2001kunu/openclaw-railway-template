@@ -54,8 +54,8 @@ RUN pnpm ui:install && pnpm ui:build
 FROM node:22-bookworm
 ENV NODE_ENV=production
 
-# Cache buster for Tailscale rebuild - 2026-02-18T18:15:00Z
-RUN echo "Rebuilding with Tailscale support v4"
+# Cache buster for Tailscale rebuild - 2026-02-18-v5-userspace
+RUN echo "Rebuilding with Tailscale userspace mode"
 
 RUN apt-get update \
   && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
@@ -71,12 +71,9 @@ RUN apt-get update \
     python3 \
     pkg-config \
     sudo \
-    iptables \
-    gnupg \
-    lsb-release \
   && rm -rf /var/lib/apt/lists/*
 
-# Install Tailscale
+# Install Tailscale (userspace mode - no TUN device required for Railway)
 RUN curl -fsSL https://pkgs.tailscale.com/stable/debian/bookworm.noarmor.gpg | tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null \
   && curl -fsSL https://pkgs.tailscale.com/stable/debian/bookworm.tailscale-keyring.list | tee /etc/apt/sources.list.d/tailscale.list \
   && apt-get update \
@@ -125,16 +122,16 @@ COPY skills /openclaw/skills
 ENV PORT=8080
 EXPOSE 8080
 
-# Start script that initializes Tailscale then runs OpenClaw
+# Start script that initializes Tailscale (userspace mode) then runs OpenClaw
 RUN printf '%s\n' \
   '#!/bin/bash' \
   'set -e' \
   '' \
-  '# Start Tailscale if auth key is provided' \
+  '# Start Tailscale if auth key is provided (userspace mode - no TUN required)' \
   'if [ -n "$TS_AUTHKEY" ]; then' \
-  '  echo "Starting Tailscale..."' \
-  '  tailscaled --state=/var/lib/tailscale/tailscaled.state --socket=/var/run/tailscale/tailscaled.sock &' \
-  '  sleep 2' \
+  '  echo "Starting Tailscale in userspace mode..."' \
+  '  tailscaled --tun=userspace-networking --state=/var/lib/tailscale/tailscaled.state --socket=/var/run/tailscale/tailscaled.sock &' \
+  '  sleep 3' \
   '  tailscale up --authkey="$TS_AUTHKEY" --hostname="${TS_HOSTNAME:-openclaw-gateway}" --accept-routes' \
   '  echo "Tailscale connected: $(tailscale ip -4 2>/dev/null || echo waiting...)"' \
   'fi' \

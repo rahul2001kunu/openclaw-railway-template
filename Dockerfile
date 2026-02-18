@@ -70,6 +70,7 @@ RUN apt-get update \
     sudo \
     iptables \
     gnupg \
+    lsb-release \
   && rm -rf /var/lib/apt/lists/*
 
 # Install Tailscale

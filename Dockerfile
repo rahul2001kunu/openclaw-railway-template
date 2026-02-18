@@ -68,7 +68,19 @@ RUN apt-get update \
     python3 \
     pkg-config \
     sudo \
+    iptables \
+    gnupg \
   && rm -rf /var/lib/apt/lists/*
+
+# Install Tailscale
+RUN curl -fsSL https://pkgs.tailscale.com/stable/debian/bookworm.noarmor.gpg | tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null \
+  && curl -fsSL https://pkgs.tailscale.com/stable/debian/bookworm.tailscale-keyring.list | tee /etc/apt/sources.list.d/tailscale.list \
+  && apt-get update \
+  && apt-get install -y tailscale \
+  && rm -rf /var/lib/apt/lists/*
+
+# Create Tailscale state directory
+RUN mkdir -p /var/lib/tailscale && chmod 755 /var/lib/tailscale
 
 # Install Homebrew (must run as non-root user)
 # Create a user for Homebrew installation, install it, then make it accessible to all users
@@ -107,4 +119,23 @@ COPY skills /openclaw/skills
 
 ENV PORT=8080
 EXPOSE 8080
-CMD ["node", "src/server.js"]
+
+# Start script that initializes Tailscale then runs OpenClaw
+RUN printf '%s\n' \
+  '#!/bin/bash' \
+  'set -e' \
+  '' \
+  '# Start Tailscale if auth key is provided' \
+  'if [ -n "$TS_AUTHKEY" ]; then' \
+  '  echo "Starting Tailscale..."' \
+  '  tailscaled --state=/var/lib/tailscale/tailscaled.state --socket=/var/run/tailscale/tailscaled.sock &' \
+  '  sleep 2' \
+  '  tailscale up --authkey="$TS_AUTHKEY" --hostname="${TS_HOSTNAME:-openclaw-gateway}" --accept-routes' \
+  '  echo "Tailscale connected: $(tailscale ip -4 2>/dev/null || echo waiting...)"' \
+  'fi' \
+  '' \
+  '# Start OpenClaw wrapper' \
+  'exec node src/server.js' \
+  > /app/start.sh && chmod +x /app/start.sh
+
+CMD ["/app/start.sh"]

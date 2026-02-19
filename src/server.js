@@ -325,6 +325,250 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+// ========== GATEWAY LOCK CLEANUP ==========
+// Railway containers can restart in-place (On Failure policy), leaving stale lock files.
+// This cleanup ensures we don't get blocked by a zombie/stale lock.
+
+function getGatewayLockDir() {
+  const uid = typeof process.getuid === "function" ? process.getuid() : "";
+  return path.join(os.tmpdir(), `openclaw-${uid}`);
+}
+
+function getGatewayLockPath() {
+  const lockDir = getGatewayLockDir();
+  const configHash = crypto
+    .createHash("sha1")
+    .update(configPath())
+    .digest("hex")
+    .slice(0, 8);
+  return path.join(lockDir, `gateway.${configHash}.lock`);
+}
+
+function isPidAlive(pid) {
+  if (!Number.isFinite(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function getProcessListeningOnPort(port) {
+  try {
+    const result = await runCmd("ss", ["-tlnp", `sport = :${port}`], { timeoutMs: 5000 });
+    if (result.code !== 0 || !result.output) return null;
+    const match = result.output.match(/pid=(\d+)/);
+    return match ? Number.parseInt(match[1], 10) : null;
+  } catch {
+    return null;
+  }
+}
+
+async function cleanupStaleGatewayLock() {
+  console.log(`[gateway-lock] ========== STALE LOCK CLEANUP ==========`);
+  
+  const lockDir = getGatewayLockDir();
+  const lockPath = getGatewayLockPath();
+  
+  console.log(`[gateway-lock] Lock directory: ${lockDir}`);
+  console.log(`[gateway-lock] Lock file path: ${lockPath}`);
+  
+  // Check if lock directory exists
+  try {
+    if (!fs.existsSync(lockDir)) {
+      console.log(`[gateway-lock] Lock directory does not exist, creating...`);
+      fs.mkdirSync(lockDir, { recursive: true });
+      console.log(`[gateway-lock] ✓ No stale lock to clean (directory created)`);
+      return;
+    }
+  } catch (err) {
+    console.log(`[gateway-lock] Could not check/create lock directory: ${err.message}`);
+    return;
+  }
+  
+  // Check if lock file exists
+  try {
+    if (!fs.existsSync(lockPath)) {
+      console.log(`[gateway-lock] ✓ No lock file exists, proceeding with gateway start`);
+      return;
+    }
+  } catch (err) {
+    console.log(`[gateway-lock] Could not check lock file: ${err.message}`);
+    return;
+  }
+  
+  // Read and parse lock file
+  let lockPayload;
+  try {
+    const lockContent = fs.readFileSync(lockPath, "utf8");
+    console.log(`[gateway-lock] Lock file contents: ${lockContent}`);
+    lockPayload = JSON.parse(lockContent);
+  } catch (err) {
+    console.log(`[gateway-lock] ⚠️  Lock file is corrupt/unreadable, removing: ${err.message}`);
+    try {
+      fs.rmSync(lockPath, { force: true });
+      console.log(`[gateway-lock] ✓ Removed corrupt lock file`);
+    } catch (rmErr) {
+      console.error(`[gateway-lock] Failed to remove corrupt lock: ${rmErr.message}`);
+    }
+    return;
+  }
+  
+  const lockPid = lockPayload?.pid;
+  const lockCreatedAt = lockPayload?.createdAt;
+  const lockStartTime = lockPayload?.startTime;
+  
+  console.log(`[gateway-lock] Lock payload:`);
+  console.log(`[gateway-lock]   pid: ${lockPid}`);
+  console.log(`[gateway-lock]   createdAt: ${lockCreatedAt}`);
+  console.log(`[gateway-lock]   startTime: ${lockStartTime}`);
+  
+  if (!Number.isFinite(lockPid) || lockPid <= 0) {
+    console.log(`[gateway-lock] ⚠️  Invalid PID in lock file, removing`);
+    try {
+      fs.rmSync(lockPath, { force: true });
+      console.log(`[gateway-lock] ✓ Removed invalid lock file`);
+    } catch (rmErr) {
+      console.error(`[gateway-lock] Failed to remove invalid lock: ${rmErr.message}`);
+    }
+    return;
+  }
+  
+  // Check 1: Is the process alive?
+  const pidAlive = isPidAlive(lockPid);
+  console.log(`[gateway-lock] PID ${lockPid} alive check: ${pidAlive}`);
+  
+  if (!pidAlive) {
+    console.log(`[gateway-lock] ✓ PID ${lockPid} is dead, removing stale lock`);
+    try {
+      fs.rmSync(lockPath, { force: true });
+      console.log(`[gateway-lock] ✓ Removed stale lock (dead PID)`);
+    } catch (rmErr) {
+      console.error(`[gateway-lock] Failed to remove stale lock: ${rmErr.message}`);
+    }
+    return;
+  }
+  
+  // Check 2: Is the process actually listening on the gateway port?
+  const portListenerPid = await getProcessListeningOnPort(INTERNAL_GATEWAY_PORT);
+  console.log(`[gateway-lock] PID listening on port ${INTERNAL_GATEWAY_PORT}: ${portListenerPid}`);
+  
+  if (portListenerPid && portListenerPid !== lockPid) {
+    console.log(`[gateway-lock] ⚠️  Different process (${portListenerPid}) is using port ${INTERNAL_GATEWAY_PORT}`);
+    console.log(`[gateway-lock] Lock owner (${lockPid}) is not using the port, removing stale lock`);
+    try {
+      fs.rmSync(lockPath, { force: true });
+      console.log(`[gateway-lock] ✓ Removed stale lock (PID not using port)`);
+    } catch (rmErr) {
+      console.error(`[gateway-lock] Failed to remove stale lock: ${rmErr.message}`);
+    }
+    return;
+  }
+  
+  if (!portListenerPid) {
+    console.log(`[gateway-lock] ⚠️  No process is listening on port ${INTERNAL_GATEWAY_PORT}`);
+    console.log(`[gateway-lock] Lock owner (${lockPid}) exists but port is free, lock is stale`);
+    
+    // Additional check: Is lock file old (stale threshold: 5 minutes)?
+    let isStaleByTime = false;
+    try {
+      const lockStat = fs.statSync(lockPath);
+      const lockAgeMs = Date.now() - lockStat.mtimeMs;
+      const lockAgeSec = Math.floor(lockAgeMs / 1000);
+      console.log(`[gateway-lock] Lock file age: ${lockAgeSec}s (${lockStat.mtime})`);
+      
+      if (lockAgeMs > 5 * 60 * 1000) {
+        isStaleByTime = true;
+        console.log(`[gateway-lock] Lock is older than 5 minutes, considering stale`);
+      }
+    } catch (statErr) {
+      console.log(`[gateway-lock] Could not stat lock file: ${statErr.message}`);
+    }
+    
+    // Also check createdAt in payload
+    if (lockCreatedAt) {
+      try {
+        const createdTime = new Date(lockCreatedAt).getTime();
+        const payloadAgeMs = Date.now() - createdTime;
+        const payloadAgeSec = Math.floor(payloadAgeMs / 1000);
+        console.log(`[gateway-lock] Lock payload age (from createdAt): ${payloadAgeSec}s`);
+        
+        if (payloadAgeMs > 5 * 60 * 1000) {
+          isStaleByTime = true;
+          console.log(`[gateway-lock] Lock payload is older than 5 minutes, considering stale`);
+        }
+      } catch (dateErr) {
+        console.log(`[gateway-lock] Could not parse createdAt: ${dateErr.message}`);
+      }
+    }
+    
+    if (isStaleByTime) {
+      console.log(`[gateway-lock] Removing stale lock (PID alive but port free + old timestamp)`);
+      try {
+        fs.rmSync(lockPath, { force: true });
+        console.log(`[gateway-lock] ✓ Removed stale lock`);
+      } catch (rmErr) {
+        console.error(`[gateway-lock] Failed to remove stale lock: ${rmErr.message}`);
+      }
+      return;
+    }
+    
+    // Even if not old, if PID exists but port is free, it's likely a zombie
+    // Kill the process and remove the lock
+    console.log(`[gateway-lock] PID ${lockPid} exists but port ${INTERNAL_GATEWAY_PORT} is free`);
+    console.log(`[gateway-lock] Attempting to kill zombie process ${lockPid}...`);
+    try {
+      process.kill(lockPid, "SIGKILL");
+      console.log(`[gateway-lock] ✓ Sent SIGKILL to ${lockPid}`);
+      await sleep(500);
+    } catch (killErr) {
+      console.log(`[gateway-lock] Could not kill ${lockPid}: ${killErr.message}`);
+    }
+    
+    try {
+      fs.rmSync(lockPath, { force: true });
+      console.log(`[gateway-lock] ✓ Removed zombie lock`);
+    } catch (rmErr) {
+      console.error(`[gateway-lock] Failed to remove zombie lock: ${rmErr.message}`);
+    }
+    return;
+  }
+  
+  // If we get here, the lock is valid (PID alive AND listening on port)
+  console.log(`[gateway-lock] ⚠️  Lock appears valid: PID ${lockPid} is listening on port ${INTERNAL_GATEWAY_PORT}`);
+  console.log(`[gateway-lock] This may indicate another gateway instance is running`);
+  console.log(`[gateway-lock] Attempting to kill the existing gateway...`);
+  
+  try {
+    process.kill(lockPid, "SIGTERM");
+    console.log(`[gateway-lock] ✓ Sent SIGTERM to ${lockPid}`);
+    await sleep(2000);
+    
+    // Check if still alive
+    if (isPidAlive(lockPid)) {
+      console.log(`[gateway-lock] Process still alive, sending SIGKILL...`);
+      process.kill(lockPid, "SIGKILL");
+      await sleep(1000);
+    }
+    
+    // Remove lock file
+    fs.rmSync(lockPath, { force: true });
+    console.log(`[gateway-lock] ✓ Removed lock after killing existing gateway`);
+  } catch (killErr) {
+    console.error(`[gateway-lock] Failed to kill existing gateway: ${killErr.message}`);
+    console.log(`[gateway-lock] Will proceed anyway and let gateway fail if port is in use`);
+    try {
+      fs.rmSync(lockPath, { force: true });
+      console.log(`[gateway-lock] ✓ Removed lock file anyway`);
+    } catch (rmErr) {
+      console.error(`[gateway-lock] Failed to remove lock: ${rmErr.message}`);
+    }
+  }
+  
+  console.log(`[gateway-lock] ========== CLEANUP COMPLETE ==========`);
+}
+
 async function waitForGatewayReady(opts = {}) {
   const timeoutMs = opts.timeoutMs ?? 60_000;  // Increased from 20s to 60s for Railway startup
   const start = Date.now();
@@ -356,6 +600,10 @@ async function waitForGatewayReady(opts = {}) {
 async function startGateway() {
   if (gatewayProc) return;
   if (!isConfigured()) throw new Error("Gateway cannot start: not configured");
+
+  // CRITICAL: Clean up stale gateway locks before starting
+  // This prevents "gateway already running (pid X)" errors from zombie locks
+  await cleanupStaleGatewayLock();
 
   fs.mkdirSync(STATE_DIR, { recursive: true });
   fs.mkdirSync(WORKSPACE_DIR, { recursive: true });
